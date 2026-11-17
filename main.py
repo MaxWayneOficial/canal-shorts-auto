@@ -2,6 +2,7 @@
 import os
 import json
 import random
+import time
 import re
 import asyncio
 import subprocess
@@ -52,12 +53,23 @@ Usa información verificable. No inventes datos.
         "models/gemini-3.8-flash:generateContent?key=" + key
     )
 
-    r = requests.post(
-        url,
-        json={"contents": [{"parts": [{"text": prompt}]}]},
-        timeout=90
-    )
-    r.raise_for_status()
+    
+for intento in range(3):
+    try:
+        r = requests.post(
+            url,
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=(20, 240)
+        )
+        r.raise_for_status()
+        break
+    except (requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError):
+        if intento == 2:
+            raise
+        print("Gemini tardó demasiado. Reintentando...")
+        time.sleep(10 * (intento + 1))
+
 
     raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
     raw = re.sub(r"```(?:json)?", "", raw).strip()
