@@ -48,7 +48,7 @@ def generate_script():
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/"
-        "models/gemini-3.8-flash:generateContent?key="+ key
+        "models/gemini-3.8-flash:generateContent?key=" + key
     )
 
     response = requests.post(
