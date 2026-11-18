@@ -3,15 +3,20 @@ name: Generador automatico de YouTube Shorts
 on:
   workflow_dispatch:
   schedule:
+    # 15:00 UTC = 12:00 del mediodía en Argentina (UTC-3).
     - cron: '0 15 * * *'
 
 permissions:
   contents: read
 
+concurrency:
+  group: generar-youtube-shorts
+  cancel-in-progress: false
+
 jobs:
   generar:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
 
     steps:
       - name: Descargar repositorio
@@ -21,6 +26,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
 
       - name: Instalar FFmpeg y fuentes
         run: |
@@ -30,23 +37,46 @@ jobs:
       - name: Instalar dependencias de Python
         run: |
           python -m pip install --upgrade pip
-          python -m pip install requests pillow edge-tts
+          python -m pip install -r requirements.txt
 
       - name: Verificar configuración
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: qwen/qwen3.8-27b
         run: |
           python --version
           ffmpeg -version | head -n 1
-          if [ -z "$GEMINI_API_KEY" ]; then
-            echo "ERROR: falta el secreto GEMINI_API_KEY en GitHub."
+          if [ -z "$GROQ_API_KEY" ]; then
+            echo "ERROR: falta el secreto GROQ_API_KEY."
+            echo "Ruta: Settings > Secrets and variables > Actions."
             exit 1
           fi
-          echo "La clave GEMINI_API_KEY está configurada."
+          echo "Secreto GROQ_API_KEY detectado (no se muestra su valor)."
+          echo "Modelo configurado: $GROQ_MODEL"
+
+      - name: Comprobar acceso al modelo de Groq
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: qwen/qwen3.8-27b
+        run: |
+          python - <<'PYCODE'
+          import os
+          import requests
+          headers = {"Authorization": "Bearer " + os.environ["GROQ_API_KEY"]}
+          response = requests.get("https://api.groq.com/openai/v1/models", headers=headers, timeout=30)
+          if not response.ok:
+              raise SystemExit(f"Groq no aceptó la clave: HTTP {response.status_code} - {response.text[:1000]}")
+          model_ids = {item.get("id") for item in response.json().get("data", [])}
+          model = os.environ["GROQ_MODEL"]
+          if model not in model_ids:
+              raise SystemExit(f"El modelo {model} no figura entre los modelos disponibles para esta clave.")
+          print(f"Conexión Groq OK. Modelo disponible: {model}")
+          PYCODE
 
       - name: Generar video
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: qwen/qwen3.8-27b
           PYTHONUNBUFFERED: '1'
         run: python -u -X faulthandler main.py
 
@@ -57,4 +87,4 @@ jobs:
           name: short-generado
           path: output/
           retention-days: 7
-          if-no-files-found: ignore
+          if-no-files-found: warn
