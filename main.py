@@ -6,6 +6,8 @@ import re
 import subprocess
 import textwrap
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html import unescape
 from io import BytesIO
 from pathlib import Path
@@ -30,9 +32,21 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 VOICE = os.getenv("EDGE_TTS_VOICE", "es-AR-TomasNeural")
 
+# Wikimedia exige un User-Agent identificable y recomienda incluir una URL
+# de contacto. Todas las peticiones se hacen en serie y con pausa preventiva.
 HEADERS = {
-    "User-Agent": "CanalShortsAuto/2.0 (automated educational YouTube Shorts generator)"
+    "User-Agent": (
+        "CanalShortsAuto/2.1 "
+        "(https://github.com/MaxWayneOficial/canal-shorts-auto; "
+        "operator: @MaxWayneOficial) "
+        f"Python-requests/{requests.__version__}"
+    ),
+    "Accept": "application/json, image/*;q=0.9, */*;q=0.8",
+    "Accept-Encoding": "gzip",
 }
+WIKIMEDIA_MIN_REQUEST_INTERVAL = 2.5
+WIKIMEDIA_MAX_ATTEMPTS = 6
+_LAST_WIKIMEDIA_REQUEST = 0.0
 
 NICHES = [
     "ciencia cotidiana",
@@ -53,43 +67,86 @@ USED_IMAGE_TITLES = set()
 
 
 def retry_delay(response, attempt):
-    """Calcula una espera prudente para errores temporales del servidor."""
+    """Respeta Retry-After; si falta, aplica retroceso exponencial prudente."""
     if response is not None:
         value = response.headers.get("Retry-After")
         if value:
             try:
-                return min(max(float(value), 2), 90)
-            except ValueError:
-                pass
-    return min(8 * (2 ** attempt), 60)
+                return max(0.0, float(value))
+            except (TypeError, ValueError):
+                try:
+                    retry_at = parsedate_to_datetime(value)
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=timezone.utc)
+                    return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError, OverflowError):
+                    pass
+    # Wikimedia indica esperar al menos 5 segundos si no envía Retry-After.
+    return min(10.0 * (2 ** attempt), 300.0) + random.uniform(0.0, 2.0)
 
 
-def get_with_retries(url, params=None, timeout=(15, 60), attempts=4):
-    """GET con reintentos ante cortes temporales y errores HTTP 429/5xx."""
+def wait_for_wikimedia_slot():
+    """Mantiene las solicitudes secuenciales y separadas por al menos 2,5 s."""
+    global _LAST_WIKIMEDIA_REQUEST
+    now = time.monotonic()
+    elapsed = now - _LAST_WIKIMEDIA_REQUEST
+    wait = WIKIMEDIA_MIN_REQUEST_INTERVAL - elapsed
+    if wait > 0:
+        time.sleep(wait)
+    _LAST_WIKIMEDIA_REQUEST = time.monotonic()
+
+
+def get_with_retries(url, params=None, timeout=(15, 60), attempts=WIKIMEDIA_MAX_ATTEMPTS):
+    """GET tolerante a 429/503, respetando Retry-After y errores API ratelimited."""
     last_error = None
     for attempt in range(attempts):
         response = None
         try:
-            response = requests.get(
-                url, params=params, headers=HEADERS, timeout=timeout
-            )
-            if response.status_code == 429 or response.status_code >= 500:
+            wait_for_wikimedia_slot()
+            response = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+
+            retryable = response.status_code in (429, 503) or response.status_code >= 500
+            api_error = None
+            if response.ok and url == COMMONS_API:
+                try:
+                    body = response.json()
+                    api_error = body.get("error", {}) if isinstance(body, dict) else {}
+                except ValueError:
+                    api_error = {}
+                if api_error.get("code") in {"ratelimited", "maxlag"}:
+                    retryable = True
+
+            if retryable:
                 if attempt == attempts - 1:
-                    response.raise_for_status()
+                    detail = (response.text or "")[:1200]
+                    reason = f"API {api_error.get('code')}" if api_error else f"HTTP {response.status_code}"
+                    raise RuntimeError(
+                        f"Wikimedia sigue limitando las solicitudes ({reason}) "
+                        f"después de {attempts} intentos. Respuesta: {detail}"
+                    )
                 wait = retry_delay(response, attempt)
-                print(f"Wikimedia HTTP {response.status_code}; reintento en {wait:.0f}s.")
+                reason = f"HTTP {response.status_code}"
+                if api_error:
+                    reason = f"API {api_error.get('code')}"
+                print(
+                    f"Wikimedia {reason}; esperando {wait:.0f} s antes del "
+                    f"reintento {attempt + 2}/{attempts}."
+                )
                 time.sleep(wait)
                 continue
+
             response.raise_for_status()
             return response
+
         except (requests.Timeout, requests.ConnectionError) as exc:
             last_error = exc
             if attempt == attempts - 1:
                 break
-            wait = min(5 * (2 ** attempt), 30)
-            print(f"Corte de conexión; reintento en {wait}s.")
+            wait = min(8.0 * (2 ** attempt), 120.0)
+            print(f"Conexión con Wikimedia interrumpida; reintentando en {wait:.0f} s.")
             time.sleep(wait)
-    raise RuntimeError(f"No se pudo conectar con Wikimedia Commons: {last_error}")
+
+    raise RuntimeError(f"No se pudo completar la solicitud a Wikimedia Commons: {last_error}")
 
 
 def generate_script():
@@ -239,16 +296,15 @@ REGLAS:
 
 
 def build_search_terms(term):
-    """Prepara búsquedas alternativas si el término inicial es muy específico."""
+    """Devuelve como máximo dos consultas para no saturar la API."""
+    term = str(term or "").strip()
     words = re.findall(r"[a-zA-Z]{3,}", term.lower())
     useful = [word for word in words if word not in STOP_WORDS]
-    terms = [term.strip()]
-    if useful:
-        terms.append(" ".join(useful))
-        for index in range(len(useful) - 1):
-            terms.append(" ".join(useful[index:index + 2]))
-        terms.extend(reversed(useful))
-    return list(dict.fromkeys(query for query in terms if query))
+    terms = [term] if term else []
+    simplified = " ".join(useful)
+    if simplified and simplified.casefold() not in {item.casefold() for item in terms}:
+        terms.append(simplified)
+    return terms[:2]
 
 
 def clean_html(value):
@@ -260,18 +316,19 @@ def find_image(term, index):
     """Busca una imagen en Wikimedia Commons y conserva su atribución."""
     selected = None
     for query in build_search_terms(term):
-        print(f"Buscando imagen {index + 1}/{SCENE_COUNT}: {query}")
+        print(f"Buscando imagen {index + 1}/{SCENE_COUNT} en Wikimedia: {query}")
         params = {
             "action": "query",
             "format": "json",
             "generator": "search",
             "gsrsearch": query,
             "gsrnamespace": 6,
-            "gsrlimit": 35,
+            "gsrlimit": 15,
             "prop": "imageinfo",
             "iiprop": "url|extmetadata|mime",
-            "iiurlwidth": 1400,
+            "iiurlwidth": 1200,
             "iiextmetadatalanguage": "en",
+            "maxlag": 5,
         }
         payload = get_with_retries(COMMONS_API, params=params).json()
         if "error" in payload:
@@ -298,9 +355,9 @@ def find_image(term, index):
 
         if candidates:
             selected = random.choice(candidates)
-            print(f"Imagen encontrada con la búsqueda: {query}")
+            print(f"Imagen encontrada para la escena {index + 1}.")
             break
-        print(f"No hubo imágenes nuevas con licencia identificable para: {query}")
+        print(f"Sin imágenes nuevas con licencia identificable para: {query}.")
 
     if selected is None:
         raise RuntimeError(
