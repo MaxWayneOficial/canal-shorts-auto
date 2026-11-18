@@ -177,64 +177,88 @@ No incluyas consejos peligrosos ni afirmaciones médicas.
 
 
 # BUSCAR IMÁGENES EN WIKIMEDIA COMMONS
+def 
 def find_image(term, index):
 
-    params = {
-        "action": "query",
-        "format": "json",
-        "generator": "search",
-        "gsrsearch": term,
-        "gsrnamespace": 6,
-        "gsrlimit": 20,
-        "prop": "imageinfo",
-        "iiprop": "url|extmetadata",
-        "iiurlwidth": 1400
-    }
+    words = re.findall(r"[a-zA-Z]{3,}", term.lower())
 
-    response = requests.get(
-        API,
-        params=params,
-        headers=HEADERS,
-        timeout=(15, 60)
-    )
+    search_terms = [
+        term,
+        " ".join(words[:4]),
+        " ".join(words[:3]),
+        " ".join(words[-2:])
+    ]
 
-    response.raise_for_status()
-
-    pages = list(
-        response.json()
-        .get("query", {})
-        .get("pages", {})
-        .values()
-    )
+    search_terms = list(dict.fromkeys(
+        q.strip() for q in search_terms if q.strip()
+    ))
 
     choices = []
 
-    for page in pages:
+    for search_term in search_terms:
 
-        info = (page.get("imageinfo") or [{}])[0]
-        meta = info.get("extmetadata", {})
+        params = {
+            "action": "query",
+            "format": "json",
+            "generator": "search",
+            "gsrsearch": search_term,
+            "gsrnamespace": 6,
+            "gsrlimit": 50,
+            "prop": "imageinfo",
+            "iiprop": "url|extmetadata",
+            "iiurlwidth": 1400
+        }
 
-        license_name = (
-            meta.get("LicenseShortName", {})
-            .get("value", "")
+        response = requests.get(
+            API,
+            params=params,
+            headers=HEADERS,
+            timeout=(15, 60)
         )
 
-        mime = info.get("mime", "")
+        response.raise_for_status()
 
-        if (
-            info.get("thumburl")
-            and license_name
-            and mime.startswith("image/")
-        ):
-            choices.append((page, info, meta))
+        pages = list(
+            response.json()
+            .get("query", {})
+            .get("pages", {})
+            .values()
+        )
+
+        for page in pages:
+
+            info = (page.get("imageinfo") or [{}])[0]
+            meta = info.get("extmetadata", {})
+
+            license_name = (
+                meta.get("LicenseShortName", {}).get("value", "")
+                or meta.get("UsageTerms", {}).get("value", "")
+            )
+
+            mime = info.get("mime", "")
+
+            if (
+                info.get("thumburl")
+                and license_name
+                and (not mime or mime.startswith("image/"))
+            ):
+                choices.append(
+                    (page, info, meta, license_name)
+                )
+
+        if choices:
+            print("Imagen encontrada:", search_term)
+            break
+
+        print("Sin resultados con licencia:", search_term)
 
     if not choices:
         raise RuntimeError(
-            "Wikimedia Commons no encontró una imagen "
-            "con licencia identificable para: " + term
+            "No se encontraron imágenes con licencia identificable: "
+            + " | ".join(search_terms)
         )
 
-    page, info, meta = random.choice(choices)
+    page, info, meta, license_name = random.choice(choices)
 
     download = requests.get(
         info["thumburl"],
@@ -249,18 +273,12 @@ def find_image(term, index):
 
     def clean(value):
         return unescape(
-            re.sub(
-                r"<[^>]*>",
-                "",
-                str(value or "")
-            )
+            re.sub(r"<[^>]*>", "", str(value or ""))
         ).strip()
 
     credit = {
         "archivo": page.get("title", ""),
-        "autor": clean(
-            meta.get("Artist", {}).get("value", "")
-        ),
+        "autor": clean(meta.get("Artist", {}).get("value", "")),
         "licencia": clean(license_name),
         "fuente": info.get("descriptionurl", "")
     }
@@ -269,7 +287,6 @@ def find_image(term, index):
         credit["fuente"] = "https://commons.wikimedia.org/"
 
     return path, credit
-
 
 # GENERAR VOZ EN ESPAÑOL
 async def generate_voice(text):
