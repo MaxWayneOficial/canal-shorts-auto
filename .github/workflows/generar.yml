@@ -22,6 +22,11 @@ jobs:
       - name: Descargar repositorio
         uses: actions/checkout@v4
 
+      - name: Preparar carpeta de resultados y diagnosticos
+        run: |
+          mkdir -p output
+          printf 'El workflow se inició correctamente.\n' > output/diagnostico.txt
+
       - name: Configurar Python
         uses: actions/setup-python@v5
         with:
@@ -39,7 +44,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Verificar configuración
+      - name: Verificar configuracion
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GROQ_MODEL: qwen/qwen3.8-27b
@@ -73,18 +78,25 @@ jobs:
           print(f"Conexión Groq OK. Modelo disponible: {model}")
           PYCODE
 
-      - name: Generar video
+      - name: Generar video y guardar registro completo
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GROQ_MODEL: qwen/qwen3.8-27b
           PYTHONUNBUFFERED: '1'
-        run: python -u -X faulthandler main.py
+        shell: bash
+        run: |
+          mkdir -p output
+          set +e
+          python -u -X faulthandler main.py 2>&1 | tee output/generation.log
+          python_status=${PIPESTATUS[0]}
+          printf 'Código de salida de Python: %s\n' "$python_status" > output/exit_code.txt
+          exit "$python_status"
 
-      - name: Guardar Short generado
+      - name: Guardar Short o diagnosticos
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: short-generado
+          name: short-generado-o-diagnostico
           path: output/
           retention-days: 7
           if-no-files-found: warn
